@@ -1,0 +1,701 @@
+#include "../TYPES/WMMStructs.h"
+#include "../TYPES/interpolation.h"
+#include "../TYPES/utils.h"
+#include <math.h>
+#include <stdlib.h>
+#include <vector>
+#include <unordered_map>
+#include <map>
+#include <iostream>
+
+
+namespace wmm {
+
+    Node3D GetInterpCpolar(AugWmm &wave, Node3D &f0, Node3D &f1, double epsilon, int interp, int side) {
+    
+        Node3D c_polar;
+        
+        if (wave.dir < 0) {
+            return f0;
+        }
+
+        switch (interp) {
+            case I_LINEAR:
+                c_polar = (1.0 - epsilon)*f0 + epsilon*f1;
+                break;
+            case I_QUADATRIC:
+                c_polar = epsilon*epsilon*wave.fm[2*side + 2] + epsilon*wave.fm[2*side + 1] + wave.fm[0];
+                break;
+            case I_SPLINE:
+                c_polar = (1.0 - epsilon) * f0 + epsilon * f1 + 
+                        epsilon * (1.0 - epsilon) * 
+                        ((1.0 - epsilon) * wave.fm[2*side] + epsilon * wave.fm[2*side + 1]);
+                //c_polar = f0 + epsilon*(-1.0/6.0*wave.fm[2*side + 1] - 2.0/3.0*wave.fm[2*side] + f1 - f0 + epsilon*(
+                //        0.5*wave.fm[2*side] + epsilon/6.0*(wave.fm[2*side + 1] - wave.fm[2*side])));
+                break;
+            default: //I_HERMITE and I_PCHIP
+                double t_2 = epsilon * epsilon;
+                double t_3 = epsilon * t_2;
+                c_polar = (2.0 * t_3 - 3.0 * t_2 + 1.0) * f0 + (t_3 - 2.0 * t_2 + epsilon) * wave.fm[2*side] +
+                     (-2.0 * t_3 + 3.0 * t_2) * f1 + (t_3 - t_2) * wave.fm[2*side + 1];
+        }
+        if ((c_polar.z < f0.z && c_polar.z < f1.z) || (c_polar.z > f0.z && c_polar.z > f1.z)) {
+            c_polar = (1.0 - epsilon)*f0 + epsilon*f1;
+        }
+
+        return c_polar;
+    
+    }
+    
+    double GetInterpV(AugWmm &wave, double t_epsilon, int interp, int side, int gamma) {
+        // f0, f1 and f0 must be in polar coordinates
+        
+        int segment = (t_epsilon >= 1.0) ? gamma - 1 : (int) floor(gamma * t_epsilon);
+        double value, y0 = (segment == 0) ? wave.v[0] : wave.v[side * gamma + segment];
+        double y1 = wave.v[side * gamma + segment + 1];
+        double step = 1.0/ (double) gamma;
+        double epsilon = (t_epsilon - segment * step) / step;
+                
+        if (wave.dir == -1) {
+            return y0;
+        }
+        
+        switch (interp) {
+            case I_LINEAR:
+                value = (1.0 - epsilon)*y0 + epsilon*y1;
+                break;
+            case I_QUADATRIC:
+                value = epsilon*epsilon*wave.m[3*side*gamma + 3*segment + 2] +
+                        epsilon*wave.m[3*side*gamma + 3*segment + 1] +
+                        wave.m[3*side*gamma + 3*segment];
+                break;
+            case I_SPLINE:
+                value = (1.0 - epsilon) * y0 + epsilon * y1 + 
+                        epsilon * (1.0 - epsilon) * 
+                        (wave.m[2*side*gamma + 2*segment] * (1.0 - epsilon) + wave.m[2*side*gamma + 2*segment + 1] * epsilon);
+                //value = y0 + epsilon*(-wave.m[2*side + 1]/6.0 - wave.m[2*side]/3.0 + y1 - y0 + 
+                //        epsilon*(wave.m[2*side]/2.0 + epsilon*(wave.m[2*side + 1] - wave.m[2*side])/6.0));
+                break;
+            default: //I_HERMITE and I_PCHIP
+                double t_2 = epsilon * epsilon;
+                double t_3 = epsilon * t_2;
+                value = (2.0 * t_3 - 3.0 * t_2 + 1.0) * y0 + (t_3 - 2.0 * t_2 + epsilon) * wave.m[side*(gamma + 1) + segment] +
+                       (-2.0 * t_3 + 3.0 * t_2) * y1 + (t_3 - t_2) * wave.m[side*(gamma + 1) + segment + 1];
+        }
+        if ((value < y0 && value < y1)) {
+            value = (1.0 - epsilon)*y0 + epsilon*y1;
+        }
+        return value;
+    }
+    
+    double GetInterpValue(Grid &image, AugWmm &wave, NodeD &dp, NodeD &dd, NodeD &dn, NodeD &h,
+                          Node3D &f0, Node3D &f1, Node3D &fn, double epsilon, int interp, int side, int gamma) {
+
+        // f0, f1 and f0 must be in polar coordinates
+        double v = GetInterpV(wave, epsilon, interp, side, gamma);
+
+        NodeD pos = (dp + epsilon*dd) / h, posN = dn / h;
+        NodeD diff = dn - dp - epsilon*dd;
+
+        Node3D c_polar = GetInterpCpolar(wave, f0, f1, epsilon, interp, side);
+        double ft2 = GetIntegralValue(image, pos, posN, c_polar.z, fn.z, interp, 1);
+        double value = v + norm(diff) * ft2; //(c_polar.z + fn.z + 2.0 * ft2) / 4.0;
+        
+        return value;
+    }
+
+
+    double GetEpsilonGradient(NodeD &dd, NodeD &dp, NodeD &dn, NodeD &fn) {
+
+        double epsilon = 0.0;
+        double A = -dd.y, B = dd.x, C = dd.y * dp.x - dd.x * dp.y;
+        double den = A * fn.x + B * fn.y;
+        double t = (A * dn.x + B * dn.y + C) / den;
+
+        NodeD x(dn.y - t * fn.y, dn.x - t * fn.x);
+        if (fabs(dd.x) > 0.0 && fabs(den) > 0.0)
+            epsilon = (x.x - dp.x) / dd.x;
+        else if (fabs(dd.y) > 0.0 && fabs(den) > 0.0)
+            epsilon = (x.y - dp.y) / dd.y;
+        else if (fabs(den) == 0.0 && norm(dd) > 0.0) {
+            double dist = fabs(A * dn.x + B * dn.y + C) / sqrt(A * A + B * B);
+            epsilon = (norm(dn - dp) - dist) / (fabs(dd.x) + fabs(dd.y));
+        }
+        else
+            return 0.0;
+
+        if (epsilon < 0.0)
+            epsilon = 0.0;
+        else if (epsilon > 1.0)
+            epsilon = 1.0;
+        return epsilon;
+
+    }
+
+    double GetEpsilonHopfLax(NodeD &dd, NodeD &dp, NodeD &dn, double y0, double y1) {
+
+        if (norm(dn - dp - dd) < TAU) {
+            return 0.0;
+        }
+        else if (norm(dn - dp) < TAU) {
+            return 1.0;
+        }
+        NodeD xy = dn - dp;
+        double nxy = norm(xy);
+        double nyz = norm(dd);
+
+        double c_alpha = (xy.x * dd.x + xy.y * dd.y) / (nxy * nyz);
+        double c_delta = (y1 - y0) / nyz;
+
+        if (nyz == 0.0 || c_alpha <= c_delta || c_alpha == 1.0) {
+            return 0.0;
+        }
+
+        NodeD xz = dn - dp - dd;
+        double nxz = norm(xz);
+        double c_beta = (xz.x * dd.x + xz.y * dd.y) / (nxz * nyz);
+
+        if (c_delta <= c_beta) {
+            return 1.0;
+        }
+
+        double s_delta = sqrt(1.0 - c_delta * c_delta);
+        double dist = (c_alpha * c_delta + sqrt(1.0 - c_alpha * c_alpha) * s_delta) * nxy;
+        double yzdist = sqrt(nxy * nxy - dist * dist);
+        double epsilon = yzdist / (s_delta * nyz);
+
+        return epsilon;
+
+    }
+
+    double GetEpsilonGoldenSearch(Grid &image, AugWmm &wave, NodeD &dn, NodeD &dd, NodeD &dp, NodeD &h,
+                                  Node3D &f0, Node3D &f1, Node3D &fn,
+                                  double interp, int side, int gamma) {
+
+        double a = 0.0, b = 1.0, x1 = a + (1-RESPHI)*(b - a), x2 = a + RESPHI*(b - a),
+                f_x1 = MAX_VAL, f_x2 = MAX_VAL, res;
+
+        NodeD F_x1, F_x2;
+
+        double epsilon;
+        double f_a = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, 0.0, interp, side, gamma);
+        double f_b = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, 1.0, interp, side, gamma);
+        
+        if (f_a < f_b) {
+            res = f_a; epsilon = 0.0;
+        }
+        else {
+            res = f_b; epsilon = 1.0;
+        }
+
+        f_x1 = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, x1, interp, side, gamma);
+        f_x2 = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, x2, interp, side, gamma);
+
+        while (fabs(b - a) > TAU) {
+            if(f_x1 < f_x2) {
+                b = x2; x2 = x1; f_x2 = f_x1; x1 = a + (1 - RESPHI)*(b - a);
+                f_x1 = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, x1, interp, side, gamma);
+            }
+            else {
+                a = x1; x1 = x2; f_x1 = f_x2; x2 = a + RESPHI*(b - a);
+                f_x2 = GetInterpValue(image, wave, dp, dd, dn, h, f0, f1, fn, x2, interp, side, gamma);
+            }
+        }
+
+        if (f_x1 < res) {
+            epsilon = x1_1;
+            res = f_x1;
+        }
+        if (f_x2 < res) {
+            epsilon = x2_1;
+        }
+
+        return epsilon;
+        
+    }
+
+
+    double GetVal2D(Grid &image, Grid &u_surface, AugWmm &wave, NodeD &neigh, NodeD &fn, NodeD &h, int interp, int mode, int gamma) {
+
+        NodeD f0(image.at(wave.p, 0), image.at(wave.p, 1));
+        double y0 = wave.v[0], res1, res2, step = 1.0 / (double) gamma;
+        int i;
+
+        if (isinf(norm(f0)) || isnan(norm(f0)))
+            f0 = fn;
+        
+        Node3D f0_polar = to_polar(f0), fn_polar = to_polar(fn);
+        double val = MAX_VAL;
+        if (wave.dir < 0) {
+            NodeD pos = NodeD(wave.p.y, wave.p.x);
+            double ft2 = GetIntegralValue(image, pos, neigh, norm(f0), norm(fn), interp, gamma - 1);
+
+            NodeD diff(h.y * (neigh.y - wave.p.y), h.x * (neigh.x - wave.p.x));
+            val = y0 + norm(diff) * ft2; //(norm(f0) + norm(fn) + 2.0 * ft2) / 4.0;
+        }
+        else {
+            Node p(wave.p.y + yarray[(wave.dir + 1) % 8] - yarray[wave.dir],
+                    wave.p.x + xarray[(wave.dir + 1) % 8] - xarray[wave.dir]);
+            res1 = MAX_VAL;
+            NodeD dp(h.y * wave.p.y, h.x * wave.p.x), dn(h.y * neigh.y, h.x * neigh.x);
+
+            if (u_surface.contains(p)) {
+                double y1 = wave.v[gamma];
+
+                NodeD dd(h.y * (yarray[(wave.dir + 1) % 8] - yarray[wave.dir]), h.x * (xarray[(wave.dir + 1) % 8] - xarray[wave.dir]));
+
+                NodeD f1(image.at(p, 0), image.at(p, 1)), dp_aux, dd_aux;
+                if (isinf(norm(f1)) || isnan(norm(f1)))
+                    f1 = fn;
+                
+                Node3D f1_polar = to_polar(f1);
+
+                double epsilon, epsilon_aux, res_aux;
+                switch (mode) {
+                    case M_GRADIENT:
+                        epsilon = GetEpsilonGradient(dd, dp, dn, fn);
+                        /*dd_aux = step * dd;
+                        res1 = MAX_VAL;
+                        epsilon = 0.0;
+                        for (i=0; i<gamma; i++) {
+                            dp_aux = dp + i*step*dd;
+                            epsilon_aux = (i + GetEpsilonGradient(dd_aux, dp_aux, dn, fn))*step;
+                            res_aux = GetInterpValue(wave, dp, dd, dn, f0_polar, f1_polar, fn_polar, epsilon_aux, interp, S_RIGHT, gamma);
+                            if (res_aux < res1) {
+                                res1 = res_aux;
+                                epsilon = epsilon_aux;
+                            }
+                        }*/
+                        break;
+                    case M_HOPFLAX:
+                        dd_aux = step * dd;
+                        res1 = MAX_VAL;
+                        epsilon = 0.0;
+                        y0 = wave.v[0];
+                        for (i=1; i<=gamma; i++) {
+                            y1 = wave.v[i];
+                            dp_aux = dp + (i-1)*step*dd;
+                            epsilon_aux = (i - 1 + GetEpsilonHopfLax(dd_aux, dp_aux, dn, y0, y1))*step;
+                            res_aux = GetInterpValue(image, wave, dp, dd, dn, h, f0_polar, f1_polar, fn_polar, epsilon_aux, interp, S_RIGHT, gamma);
+                            if (res_aux < res1) {
+                                res1 = res_aux;
+                                epsilon = epsilon_aux;
+                            }
+                            y0 = y1;
+                        }
+                        break;
+                    default: //M_GOLDENSEARCH
+                        epsilon = GetEpsilonGoldenSearch(image, wave, dn, dd, dp, h, f0_polar, f1_polar, fn_polar, interp, S_RIGHT, gamma);
+                }
+
+                res1 = GetInterpValue(image, wave, dp, dd, dn, h, f0_polar, f1_polar, fn_polar, epsilon, interp, S_RIGHT, gamma);
+            }
+
+            p = Node(wave.p.y + yarray[(wave.dir + 7) % 8] - yarray[wave.dir],
+                    wave.p.x + xarray[(wave.dir + 7) % 8] - xarray[wave.dir]);
+            res2 = MAX_VAL;
+
+            if (u_surface.contains(p)) {
+
+                double y1 = wave.v[2*gamma];
+
+                NodeD dd(h.y * (yarray[(wave.dir + 7) % 8] - yarray[wave.dir]), h.x * (xarray[(wave.dir + 7) % 8] - xarray[wave.dir]));
+
+                NodeD f1(image.at(p, 0), image.at(p, 1)), dp_aux, dd_aux;
+                if (isinf(norm(f1)) || isnan(norm(f1)))
+                    f1 = fn;
+                
+                Node3D f1_polar = to_polar(f1);
+
+                double epsilon, epsilon_aux, res_aux;
+                switch (mode) {
+                    case M_GRADIENT:
+                        epsilon = GetEpsilonGradient(dd, dp, dn, fn);
+                        /*dd_aux = step * dd;
+                        res2 = MAX_VAL;
+                        epsilon = 0.0;
+                        for (i=0; i<gamma; i++) {
+                            dp_aux = dp + i*step*dd;
+                            epsilon_aux = (i + GetEpsilonGradient(dd_aux, dp_aux, dn, fn))*step;
+                            res_aux = GetInterpValue(wave, dp, dd, dn, f0_polar, f1_polar, fn_polar, epsilon_aux, interp, S_LEFT, gamma);
+                            if (res_aux < res2) {
+                                res2 = res_aux;
+                                epsilon = epsilon_aux;
+                            }
+                        }*/
+                        break;
+                    case M_HOPFLAX:
+                        dd_aux = step * dd;
+                        res2 = MAX_VAL;
+                        epsilon = 0.0;
+                        y0 = wave.v[0];
+                        for (i=1; i<=gamma; i++) {
+                            y1 = wave.v[gamma + i];
+                            dp_aux = dp + (i-1)*step*dd;
+                            epsilon_aux = (i - 1 + GetEpsilonHopfLax(dd_aux, dp_aux, dn, y0, y1))*step;
+                            res_aux = GetInterpValue(image, wave, dp, dd, dn, h, f0_polar, f1_polar, fn_polar, epsilon_aux, interp, S_LEFT, gamma);
+                            if (res_aux < res2) {
+                                res2 = res_aux;
+                                epsilon = epsilon_aux;
+                            }
+                            y0 = y1;
+                        }
+                        break;
+                    default: //M_GOLDENSEARCH
+                        epsilon = GetEpsilonGoldenSearch(image, wave, dn, dd, dp, h, f0_polar, f1_polar, fn_polar, interp, S_LEFT, gamma);
+                }
+
+                res2 = GetInterpValue(image, wave, dp, dd, dn, h, f0_polar, f1_polar, fn_polar, epsilon, interp, S_LEFT, gamma);
+
+            }
+
+            val = std::min(res1, res2);
+
+        }
+        
+        return val;
+
+    }
+
+
+    void setSimpleCoeffs2D(double *y, double *m, int pos, int interp) {
+
+        switch (interp) {
+            case I_LINEAR:
+                break;
+            case I_QUADATRIC:
+                m[0] = y[pos];
+                if (pos%2 == 0) {
+                    m[2] = (y[(pos+2)%8] + y[pos] - 2.0*y[(pos+1)%8])/2.0;
+                    m[1] = y[(pos+1)%8] - y[pos] - m[2];
+                    m[4] = (y[(pos+6)%8] + y[pos] - 2.0*y[(pos+7)%8])/2.0;
+                    m[3] = y[(pos+7)%8] - y[pos] - m[4];
+                }
+                else {
+                    m[2] = m[4] = (y[(pos+1)%8] + y[(pos+7)%8] - 2.0*y[pos])/2.0;
+                    m[1] = y[pos] - y[(pos+7)%8] + m[2];
+                    m[3] = y[pos] - y[(pos+1)%8] + m[4];
+                }
+                break;
+            case I_SPLINE:
+                if (pos%2 == 0) {
+                    m[0] = m[2] = 0.0;
+                    m[1] = 6.0*(y[pos] - 2.0*y[(pos+1)%8] + y[(pos+2)%8])/4.0;
+                    m[3] = 6.0*(y[pos] - 2.0*y[(pos+7)%8] + y[(pos+6)%8])/4.0;
+                }
+                else {
+                    m[0] = m[2] = 6.0*(y[(pos+7)%8] - 2.0*y[pos] + y[(pos+1)%8])/4.0;
+                    m[1] = m[3] = 0.0;
+                }
+                break;
+            case I_HERMITE:
+                if (pos%2 == 0) {
+                    m[0] = y[(pos + 1) % 8] - y[pos];
+                    m[1] = 1.0 / 2.0 * (y[(pos + 2) % 8] - y[pos]);
+                    m[2] = y[(pos + 7) % 8] - y[pos];
+                    m[3] = 1.0 / 2.0 * (y[(pos + 6) % 8] - y[pos]);
+                }
+                else {
+                    m[0] = 1.0 / 2.0 * (y[(pos + 1) % 8] - y[(pos + 7) % 8]);
+                    m[1] = y[(pos + 1) % 8] - y[pos];
+                    m[2] = -m[0];
+                    m[3] = y[(pos + 7) % 8] - y[pos];
+                }
+                break;
+            default: //I_PCHIP
+                if (pos%2 == 0) {
+                    double d0 = y[(pos + 1) % 8] - y[pos], d1 = y[(pos + 2) % 8] - y[(pos + 1) % 8];
+                    m[0] = (3.0 * d0 - d1) / 2.0;
+                    if ((m[0] * d0) <= 0.0)
+                        m[0] = 0.0;
+                    else if (((d1 * d0) <= 0.0) && (fabs(m[0]) > fabs(3.0 * d0)))
+                        m[0] = 3.0 * d0;
+                    m[1] = (d0 * d1 <= 0.0) ? 0.0 : 2.0 * d0 * d1 / (d0 + d1);
+
+                    d0 = y[(pos + 7) % 8] - y[pos]; d1 = y[(pos + 6) % 8] - y[(pos + 7) % 8];
+                    m[2] = (3.0 * d0 - d1) / 2.0;
+                    if ((m[2] * d0) <= 0.0)
+                        m[2] = 0.0;
+                    else if (((d1 * d0) <= 0.0) && (fabs(m[2]) > fabs(3.0 * d0)))
+                        m[2] = 3.0 * d0;
+                    m[3] = (d0 * d1 <= 0.0) ? 0.0 : 2.0 * d0 * d1 / (d0 + d1);
+                }
+                else {
+                    double d0 = y[pos] - y[(pos + 7) % 8], d1 = y[(pos + 1) % 8] - y[pos];
+                    m[0] = (d0 * d1 <= 0.0) ? 0.0 : 2.0 * d0 * d1 / (d0 + d1);
+                    m[1] = (3.0 * d1 - d0) / 2.0;
+                    if ((m[1] * d1) <= 0.0)
+                        m[1] = 0.0;
+                    else if (((d0 * d1) <= 0.0) && (fabs(m[1]) > fabs(3.0 * d1)))
+                        m[1] = 3.0 * d1;
+
+                    d0 = y[pos] - y[(pos + 1) % 8]; d1 = y[(pos + 7) % 8] - y[pos];
+                    m[2] = (d0 * d1 <= 0.0) ? 0.0 : 2.0 * d0 * d1 / (d0 + d1);
+                    m[3] = (3.0 * d1 - d0) / 2.0;
+                    if ((m[3] * d1) <= 0.0)
+                        m[3] = 0.0;
+                    else if (((d0 * d1) <= 0.0) && (fabs(m[3]) > fabs(3.0 * d1)))
+                        m[3] = 3.0 * d1;
+                }
+        }
+
+    }
+
+    void WmmAugSurface2D(Grid &image, std::vector<Node> &initials, NodeD &h, int interp, int mode,
+                              int N, int gamma, Grid &u_surface) {
+
+        bool isnewpos[8];
+        double valcenter[8];
+        double imcenter_module[8];
+        double imcenter_cos[8];
+        double imcenter_sin[8], step = 1.0/gamma;
+        double vinterp[2*gamma + 1], value;
+        
+        int degree = (N == 0) ? 1 : N, M = 10;
+                
+        double module_values[degree], cos_values[degree], sin_values[degree];
+
+        Grid_<unsigned char> state = Grid_<unsigned char>(image.rows, image.cols);
+
+        std::multimap<double, AugWmm > trial_set;
+        std::unordered_map<int, std::multimap<double, AugWmm >::iterator> mapa_trial;
+        std::unordered_map<int, double> augmented_values;
+
+        std::multimap<double, AugWmm >::iterator trial_set_it;
+        std::unordered_map<int, std::multimap<double, AugWmm >::iterator>::iterator mapa_trial_it;
+        std::pair<double, AugWmm > pr_trial;
+        std::pair<int, std::multimap<double, AugWmm >::iterator> pr_mapa;
+
+        int key, i, j;
+        AugWmm winner, new_w, new_w1(N, M, gamma);
+        Node neigh, father, augment_key, neigh1, d1, d2;
+        NodeD neighD, neighD1, fn, neigh_aux, c;
+        Node3D polar0, polar1, polar2;
+
+        // Initialization
+        for (i = 0; i < (int) initials.size(); i++) {
+            key = initials[i].y * u_surface.cols + initials[i].x;
+            if (mapa_trial.find(key) == mapa_trial.end() && u_surface.contains(initials[i])) {
+                winner = AugWmm(N, M, gamma);
+                u_surface.at(initials[i]) = 0.0;
+                winner.dir = -1;
+                winner.v[0] = 0.0;
+                winner.p = initials[i];
+                state.at(initials[i]) = P_TRIAL;
+                pr_trial = std::pair<double, AugWmm >(0.0, winner);
+                trial_set_it = trial_set.insert(pr_trial);
+                pr_mapa = std::pair<int, std::multimap<double, AugWmm >::iterator>(key, trial_set_it);
+                mapa_trial.insert(pr_mapa);
+            }
+        }
+
+        while (!trial_set.empty()) {
+
+            trial_set_it = trial_set.begin();
+            winner = trial_set_it->second;
+            key = winner.p.y * u_surface.cols + winner.p.x;
+            mapa_trial_it = mapa_trial.find(key);
+            //std::cout << "buscamos (" << winner.p.y << ", " << winner.p.x << ") key = " << key << std::endl;
+            if (mapa_trial_it == mapa_trial.end()) {
+                printf("ERROR: bad map alloc");
+                return;
+            }
+
+            if (mapa_trial_it->second != trial_set_it) {
+                printf("ERROR: bad trial/map alloc");
+                return;
+            }
+
+            trial_set.erase(trial_set_it);
+            mapa_trial.erase(mapa_trial_it);
+
+            state.at(winner.p) = P_ALIVE;
+            //std::cout << "ganador (" << winner.p.y << ", " << winner.p.x << ") key = " << key << " : ";
+
+            if (winner.dir >= 0) {
+                father = winner.p + Node(yarray[(winner.dir + 4) % 8], xarray[(winner.dir + 4) % 8]);
+                for (i = 0; i < 8; i++) {
+                    neigh = father + Node(yarray[i], xarray[i]);
+                    valcenter[i] = (u_surface.contains(neigh)) ? u_surface.at(neigh) : MAX_VAL;
+                }
+
+                i = winner.dir;
+
+                // COMPUTING WAVEFRONT 1st SEGMENT RIGHT
+                vinterp[0] = valcenter[i];
+                vinterp[gamma] = valcenter[(i+1)%8];
+                winner.v[0] = valcenter[i];
+                winner.v[gamma] = valcenter[(i+1)%8];
+                d1 = Node(yarray[(i+1)%8], xarray[(i+1)%8]) - Node(yarray[i], xarray[i]);
+                //std::cout << winner.v[0] << ", ";
+                for (j = 1; j < gamma; j++) {
+                    neigh_aux = winner.p + step*j*d1;
+                    if (u_surface.contains(neigh_aux)) {
+                        augment_key = Node(round(gamma * neigh_aux.y), round(gamma * neigh_aux.x));
+                        // augment_key = gamma * winner.p + j * d1;
+                        key = augment_key.y * gamma * u_surface.cols + augment_key.x;
+                        vinterp[j] = augmented_values[key];
+                    }
+                    else
+                        vinterp[j] = MAX_VAL;
+                    winner.v[j] = vinterp[j];
+                    //std::cout << winner.v[j] << ", ";
+                }
+                //std::cout << winner.v[gamma] << " : " << winner.v[0] << ", ";
+                setCoeffs2D(vinterp, winner.m, interp, gamma);
+
+                // COMPUTING WAVEFRONT 1st SEGMENT LEFT
+                vinterp[gamma] = valcenter[(i+7)%8];
+                winner.v[2*gamma] = valcenter[(i+7)%8];
+                d1 = Node(yarray[(i+7)%8], xarray[(i+7)%8]) - Node(yarray[i], xarray[i]);
+
+                for (j = 1; j < gamma; j++) {
+                    neigh_aux = winner.p + step*j*d1;
+                    if (u_surface.contains(neigh_aux)) {
+                        augment_key = Node(round(gamma * neigh_aux.y), round(gamma * neigh_aux.x));
+                        // augment_key = gamma * winner.p + j * d1;
+                        key = augment_key.y * gamma * u_surface.cols + augment_key.x;
+                        vinterp[j] = augmented_values[key];
+                    }
+                    else
+                        vinterp[j] = MAX_VAL;
+                    winner.v[gamma + j] = vinterp[j];
+                    //std::cout << winner.v[gamma + j] << ", ";
+                }
+                setCoeffs2D(vinterp, &winner.m[M/2], interp, gamma);
+                //std::cout << winner.v[2*gamma] << std::endl;
+
+                // std::cout << "WINNER: " << winner.p.x
+
+            }
+
+
+            // Neighbour temptative value computation
+            for (i = 0; i < 8; i++) {
+                neigh = winner.p + Node(yarray[i], xarray[i]);
+                isnewpos[i] = false;
+                if (u_surface.contains(neigh)) {
+                    valcenter[i] = u_surface.at(neigh);
+                    fn = NodeD(image.at(neigh, 0), image.at(neigh, 1));
+                }
+                else {
+                    valcenter[i] = winner.v[0];
+                    fn = NodeD(image.at(winner.p, 0), image.at(winner.p, 1));
+                }
+                Node3D polar = to_polar(fn);
+                imcenter_module[i] = polar.z;
+                imcenter_cos[i] = polar.x;
+                imcenter_sin[i] = polar.y;
+                if (u_surface.contains(neigh) && state.at(neigh) != P_ALIVE) {
+                    neighD = NodeD(winner.p.y + yarray[i], winner.p.x + xarray[i]);
+
+                    double val_neigh = GetVal2D(image, u_surface, winner, neighD, fn, h, interp, mode, gamma);
+                    if (val_neigh < valcenter[i]) {
+                        valcenter[i] = val_neigh;
+                        isnewpos[i] = true;
+                    }
+                }
+            }
+
+            // Update
+            for (i = 0; i < 8; i++) {
+                if (isnewpos[i]) {
+                    neigh = winner.p + Node(yarray[i], xarray[i]);
+
+                    new_w = AugWmm(N, M, gamma);
+                    new_w.dir = i;
+                    new_w.p = neigh;
+
+                    // falta asignar vs y escoger el minimo
+                    if (N > 0) {
+                        setSimpleCoeffs2D(imcenter_module, module_values, i, interp);
+                        setSimpleCoeffs2D(imcenter_cos, cos_values, i, interp);
+                        setSimpleCoeffs2D(imcenter_sin, sin_values, i, interp);
+                        for (j = 0; j < degree; j++) {
+                            new_w.fm[j].z = module_values[j];
+                            new_w.fm[j].x = cos_values[j];
+                            new_w.fm[j].y = sin_values[j];
+                        }
+                    }
+
+                    // COMPUTING WAVEFRONT 1st SEGMENT RIGHT
+                    polar0 = wmm::Node3D(imcenter_cos[i], imcenter_sin[i], imcenter_module[i]);
+                    polar1 = wmm::Node3D(imcenter_cos[(i+1)%8], imcenter_sin[(i+1)%8], imcenter_module[(i+1)%8]);
+                    d1 = wmm::Node(wmm::yarray[(i+1)%8], wmm::xarray[(i+1)%8]) - wmm::Node(wmm::yarray[i], wmm::xarray[i]);
+                    for (j = 1; j < gamma; j++) {
+                        neigh_aux = new_w.p + step*j*d1;
+
+                        if (u_surface.contains(neigh_aux)) {
+                            c = wmm::to_cartesian(GetInterpCpolar(new_w, polar0, polar1, step*j, interp, wmm::S_RIGHT));
+                            augment_key = Node(round(gamma * neigh_aux.y), round(gamma * neigh_aux.x));
+                            // augment_key = gamma * new_w.p + j * d1;
+                            key = augment_key.y * gamma * u_surface.cols + augment_key.x;
+                            value = GetVal2D(image, u_surface, winner, neigh_aux, c, h, interp, mode, gamma);
+                            if (augmented_values.find(key) == augmented_values.end() || (value < augmented_values[key]))
+                                augmented_values[key] = value;
+                        }
+                    }
+
+                    // COMPUTING WAVEFRONT 1st SEGMENT LEFT
+                    polar0 = wmm::Node3D(imcenter_cos[i], imcenter_sin[i], imcenter_module[i]);
+                    polar1 = wmm::Node3D(imcenter_cos[(i+7)%8], imcenter_sin[(i+7)%8], imcenter_module[(i+7)%8]);
+                    d1 = wmm::Node(wmm::yarray[(i+7)%8], wmm::xarray[(i+7)%8]) - wmm::Node(wmm::yarray[i], wmm::xarray[i]);
+
+                    for (j = 1; j < gamma; j++) {
+                        neigh_aux = new_w.p + step*j*d1;
+
+                        if (u_surface.contains(neigh_aux)) {
+                            augment_key = Node(round(gamma * neigh_aux.y), round(gamma * neigh_aux.x));
+                            // augment_key = gamma * new_w.p + j * d1;
+                            key = augment_key.y * gamma * u_surface.cols + augment_key.x;
+                            c = wmm::to_cartesian(GetInterpCpolar(new_w, polar0, polar1, step*j, interp, wmm::S_LEFT));
+                            value = GetVal2D(image, u_surface, winner, neigh_aux, c, h, interp, mode, gamma);
+                            if (augmented_values.find(key) == augmented_values.end() || (value < augmented_values[key]))
+                                augmented_values[key] = value;
+                        }
+                    }
+
+                    key = new_w.p.y * u_surface.cols + new_w.p.x;
+                    if (state.at(new_w.p) == P_TRIAL) {
+                        mapa_trial_it = mapa_trial.find(key);
+                        mapa_trial_it = mapa_trial.find(key);
+                        del(&(mapa_trial_it->second->second));
+                        trial_set.erase(mapa_trial_it->second);
+                        mapa_trial.erase(mapa_trial_it);
+                    }
+                    else {
+                        state.at(new_w.p) = P_TRIAL;
+                    }
+
+                    // std::cout << "guardamos (" << neigh.y << ", " << neigh.x << ") key = " << key << std::endl;
+                    pr_trial = std::pair<double, AugWmm >(valcenter[i], new_w);
+                    trial_set_it = trial_set.insert(pr_trial);
+                    pr_mapa = std::pair<int, std::multimap<double, AugWmm >::iterator>(key, trial_set_it);
+                    mapa_trial.insert(pr_mapa);
+
+                    u_surface.at(new_w.p) = valcenter[i];
+                }
+            }
+
+            del(&winner);
+
+        }
+
+        //del(&new_w1);
+        //del(&winner);
+        free(state.data);
+
+        return;
+
+    }
+
+
+    Grid WmmAugSurface2D(Grid &image, std::vector<Node> &initials, NodeD &h, int interp, int mode,
+                              int N, int gamma) {
+        Grid u_surface = Grid(MAX_VAL, image.rows, image.cols, 1);
+        WmmAugSurface2D(image, initials, h, interp, mode, N, gamma, u_surface);
+        return u_surface;
+    }
+    
+    
+}
